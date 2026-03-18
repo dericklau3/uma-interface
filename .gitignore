@@ -1,0 +1,12 @@
+dist/
+node_modules/
+skills/
+*.tsbuildinfo
+.DS_Store
+.env
+.env.*
+!.env.example
+.vite
+yarn-error.log*
+npm-debug.log*
+pnpm-debug.log*
