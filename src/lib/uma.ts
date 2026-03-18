@@ -10,7 +10,6 @@ import {
 } from 'ethers'
 import { MulticallProvider } from '@ethers-ext/provider-multicall'
 import type { EIP6963ProviderDetail } from '../wallet/types'
-import optimisticOracleV2Artifact from '../../../../../contracts/evm/workshops/uma-protocol-contracts-workshop/out/OptimisticOracleV2.sol/OptimisticOracleV2.json'
 
 export const UMA_CHAIN = {
   chainId: 84532,
@@ -69,7 +68,15 @@ export const votingV2Abi = [
   'function processResolvablePriceRequests()',
 ] as const
 
-export const optimisticOracleV2Abi = optimisticOracleV2Artifact.abi
+export const optimisticOracleV2Abi = [
+  'event RequestPrice(address indexed requester, bytes32 identifier, uint256 timestamp, bytes ancillaryData, address currency, uint256 reward, uint256 finalFee)',
+  'function getState(address requester, bytes32 identifier, uint256 timestamp, bytes ancillaryData) view returns (uint8)',
+  'function hasPrice(address requester, bytes32 identifier, uint256 timestamp, bytes ancillaryData) view returns (bool)',
+  'function getRequest(address requester, bytes32 identifier, uint256 timestamp, bytes ancillaryData) view returns (tuple(address proposer, address disputer, address currency, bool settled, tuple(bool eventBased, bool refundOnDispute, bool callbackOnPriceProposed, bool callbackOnPriceDisputed, bool callbackOnPriceSettled, uint256 bond, uint256 customLiveness) requestSettings, int256 proposedPrice, int256 resolvedPrice, uint256 expirationTime, uint256 reward, uint256 finalFee))',
+  'function proposePrice(address requester, bytes32 identifier, uint256 timestamp, bytes ancillaryData, int256 proposedPrice) returns (uint256)',
+  'function disputePrice(address requester, bytes32 identifier, uint256 timestamp, bytes ancillaryData) returns (uint256)',
+  'function settle(address requester, bytes32 identifier, uint256 timestamp, bytes ancillaryData) returns (uint256)',
+] as const
 
 export const questionEventsAbi = [
   'event QuestionInitialized(bytes32 indexed questionID, uint256 indexed requestTimestamp, address indexed creator, bytes ancillaryData, address rewardToken, uint256 reward, uint256 proposalBond)',
