@@ -1,4 +1,4 @@
-import { BrowserProvider, Contract, solidityPackedKeccak256, toUtf8Bytes, toUtf8String } from 'ethers'
+import { BrowserProvider, Contract, keccak256, solidityPacked, toUtf8Bytes, toUtf8String } from 'ethers'
 import { useEffect, useState } from 'react'
 import { useWallet } from './wallet/WalletProvider'
 import type { EIP6963ProviderDetail } from './wallet/types'
@@ -38,8 +38,11 @@ type ProposalSummary = {
 }
 
 type VotingRequest = {
+  lastVotingRound: bigint
+  isGovernance: boolean
   identifier: string
   time: bigint
+  rollCount: bigint
   ancillaryData: string
 }
 
@@ -140,10 +143,25 @@ const emptyVotingState: VotingState = {
   pendingRequests: [],
 }
 
+function getErrorMessage(error: unknown, fallback: string) {
+  if (error instanceof Error && error.message) return error.message
+  if (typeof error === 'object' && error && 'shortMessage' in error) {
+    const shortMessage = (error as { shortMessage?: unknown }).shortMessage
+    if (typeof shortMessage === 'string' && shortMessage) return shortMessage
+  }
+  return fallback
+}
+
 const DYNAMIC_QUERIES_STORAGE_KEY = 'uma.dynamicQueries.v2'
 const VOTING_DRAFTS_STORAGE_KEY = 'uma.votingDrafts.v1'
 const ORACLE_SYNC_RETRY_DELAY_MS = 900
 const ORACLE_SYNC_MAX_ATTEMPTS = 6
+const DEFAULT_VOTING_SALT = '987654321'
+const DEFAULT_ENCRYPTED_VOTE = 'ciphertext:mock-polymarket'
+const VOTING_PHASES = [
+  { value: 0, label: 'Commit', description: 'Submit the encrypted vote hash for this round.' },
+  { value: 1, label: 'Reveal', description: 'Reveal the price and salt for a prior commit.' },
+] as const
 
 function shortAddress(account: string | null) {
   if (!account) return 'Connect wallet'
@@ -172,10 +190,22 @@ function decodeAncillaryData(value: string) {
   }
 }
 
-function votePhaseLabel(phase: number | null) {
-  if (phase === 0) return 'Commit'
-  if (phase === 1) return 'Reveal'
-  return 'Unknown'
+function formatTimeRemaining(target: bigint) {
+  if (target <= 0n) return 'Not scheduled'
+
+  const now = BigInt(Math.floor(Date.now() / 1000))
+  const diff = Number(target - now)
+  if (diff <= 0) return 'Ending soon'
+
+  const hours = Math.floor(diff / 3600)
+  const minutes = Math.floor((diff % 3600) / 60)
+  if (hours > 0) return `${hours}h ${minutes}m left`
+  if (minutes > 0) return `${minutes}m left`
+  return `${diff}s left`
+}
+
+function getVotingPhaseLabel(phase: number | null) {
+  return VOTING_PHASES.find((item) => item.value === phase)?.label ?? 'Unavailable'
 }
 
 function WalletModal({
@@ -256,7 +286,7 @@ export default function App() {
   const [oracleLookup, setOracleLookup] = useState<OracleLookupState>(emptyOracleLookup)
   const [stakeAmount, setStakeAmount] = useState('')
   const [unstakeAmount, setUnstakeAmount] = useState('')
-  const [statusMessage, setStatusMessage] = useState('Connect a wallet on Base Sepolia to start.')
+  const [statusMessage, setStatusMessage] = useState('')
   const [busyAction, setBusyAction] = useState<string | null>(null)
   const [txHashInput, setTxHashInput] = useState('')
   const [dynamicQueries, setDynamicQueries] = useState<ProposeQuery[]>(() => {
@@ -270,11 +300,11 @@ export default function App() {
     }
   })
   const [votingState, setVotingState] = useState<VotingState>(emptyVotingState)
+  const [votingLoadError, setVotingLoadError] = useState<string | null>(null)
   const [selectedVotingRequestKey, setSelectedVotingRequestKey] = useState('')
+  const [votingDrawerOpen, setVotingDrawerOpen] = useState(false)
   const [votingAnswer, setVotingAnswer] = useState('Yes')
   const [votingCustomPrice, setVotingCustomPrice] = useState('')
-  const [votingSalt, setVotingSalt] = useState('987654321')
-  const [encryptedVote, setEncryptedVote] = useState('ciphertext:mock-polymarket')
   const [storedVoteDrafts, setStoredVoteDrafts] = useState<Record<string, StoredVoteDraft>>(() => {
     try {
       const raw = window.localStorage.getItem(VOTING_DRAFTS_STORAGE_KEY)
@@ -312,6 +342,8 @@ export default function App() {
       setDashboard(emptyDashboard)
       setProposals([])
       setVotingState(emptyVotingState)
+      setVotingLoadError(null)
+      setVotingDrawerOpen(false)
       return
     }
 
@@ -395,40 +427,73 @@ export default function App() {
   const loadVotingState = async () => {
     if (!wallet.selectedProvider) return
 
-    try {
-      const { votingV2 } = await getUmaContracts(wallet.selectedProvider)
-      const [currentRoundId, pendingRequests, votePhase] = await Promise.all([
-        votingV2.getCurrentRoundId(),
-        votingV2.getPendingRequests(),
-        votingV2.getVotePhase(),
-      ])
-      const roundEnd = await votingV2.getRoundEndTime(currentRoundId)
-      const nextPending = (pendingRequests as Array<{ identifier: string; time: bigint; ancillaryData: string }>).map(
-        (request) => ({
-          identifier: request.identifier,
-          time: request.time,
-          ancillaryData: request.ancillaryData,
-        }),
-      )
+    const { votingV2 } = await getUmaReadContracts(wallet.selectedProvider)
+    const [roundResult, pendingResult, phaseResult] = await Promise.allSettled([
+      votingV2.getCurrentRoundId(),
+      votingV2.getPendingRequests(),
+      votingV2.getVotePhase(),
+    ])
 
-      setVotingState({
-        currentRoundId,
-        roundEnd,
-        votePhase: Number(votePhase),
-        pendingRequests: nextPending,
-      })
+    const nextState: VotingState = {
+      currentRoundId:
+        roundResult.status === 'fulfilled' ? (roundResult.value as bigint) : emptyVotingState.currentRoundId,
+      roundEnd: emptyVotingState.roundEnd,
+      votePhase:
+        phaseResult.status === 'fulfilled' ? Number(phaseResult.value) : emptyVotingState.votePhase,
+      pendingRequests: [],
+    }
 
-      if (nextPending.length > 0) {
-        setSelectedVotingRequestKey((current) =>
-          current && nextPending.some((request) => getVotingRequestKey(request) === current)
-            ? current
-            : getVotingRequestKey(nextPending[0]),
-        )
-      } else {
-        setSelectedVotingRequestKey('')
+    const errors: string[] = []
+
+    if (roundResult.status === 'rejected') {
+      errors.push(`current round: ${getErrorMessage(roundResult.reason, 'failed to read current round')}`)
+    } else {
+      try {
+        nextState.roundEnd = await votingV2.getRoundEndTime(roundResult.value)
+      } catch (error) {
+        errors.push(`round end: ${getErrorMessage(error, 'failed to read round end time')}`)
       }
-    } catch (error) {
-      setVotingState(emptyVotingState)
+    }
+
+    if (pendingResult.status === 'fulfilled') {
+      nextState.pendingRequests = (
+        pendingResult.value as Array<{
+          lastVotingRound: bigint
+          isGovernance: boolean
+          time: bigint
+          rollCount: bigint
+          identifier: string
+          ancillaryData: string
+        }>
+      ).map((request) => ({
+        lastVotingRound: request.lastVotingRound,
+        isGovernance: request.isGovernance,
+        identifier: request.identifier,
+        time: request.time,
+        rollCount: request.rollCount,
+        ancillaryData: request.ancillaryData,
+      }))
+    } else {
+      errors.push(
+        `pending requests: ${getErrorMessage(pendingResult.reason, 'failed to read pending requests')}`,
+      )
+    }
+
+    if (phaseResult.status === 'rejected') {
+      errors.push(`vote phase: ${getErrorMessage(phaseResult.reason, 'failed to read vote phase')}`)
+    }
+
+    setVotingState(nextState)
+    setVotingLoadError(errors.length > 0 ? errors.join(' | ') : null)
+
+    if (nextState.pendingRequests.length > 0) {
+      setSelectedVotingRequestKey((current) =>
+        current && nextState.pendingRequests.some((request) => getVotingRequestKey(request) === current)
+          ? current
+          : getVotingRequestKey(nextState.pendingRequests[0]),
+      )
+    } else {
+      setSelectedVotingRequestKey('')
     }
   }
 
@@ -591,29 +656,60 @@ export default function App() {
   }
 
   const handleCommitVote = async () => {
-    if (!wallet.selectedProvider || !wallet.account || !selectedVotingRequestKey) return
+    if (!wallet.selectedProvider || !wallet.account || !selectedVotingRequestKey) {
+      setStatusMessage('Select a pending request and connect your wallet before committing.')
+      return
+    }
+    if (dashboard.staked <= 0n) {
+      setStatusMessage('Stake VotingToken before committing a vote.')
+      return
+    }
     const selectedRequest = votingState.pendingRequests.find(
       (request) => getVotingRequestKey(request) === selectedVotingRequestKey,
     )
-    if (!selectedRequest) return
+    if (!selectedRequest) {
+      setStatusMessage('The selected voting request is no longer active. Refresh vote data and try again.')
+      return
+    }
 
     const price = getVotingPrice()
-    const salt = votingSalt.trim() || '0'
+    const salt = DEFAULT_VOTING_SALT
+    const existingDraft = storedVoteDrafts[selectedVotingRequestKey]
+    const commitActionLabel = existingDraft ? 'Update commit' : 'Commit vote'
+    const commitSuccessMessage = existingDraft ? 'Vote commit updated.' : 'Vote committed.'
 
-    await runTransaction('Commit vote', async () => {
+    await runTransaction(commitActionLabel, async () => {
       const { votingV2 } = await getUmaContracts(wallet.selectedProvider!)
-      const encryptedVoteBytes = toUtf8Bytes(encryptedVote)
-      const commitHash = solidityPackedKeccak256(
-        ['int256', 'int256', 'address', 'uint256', 'bytes', 'uint256', 'bytes32'],
-        [
-          BigInt(price),
-          BigInt(salt),
-          wallet.account!,
-          selectedRequest.time,
-          selectedRequest.ancillaryData,
-          votingState.currentRoundId,
-          selectedRequest.identifier,
-        ],
+      const [commitRoundId, votePhase, voter, voterStakeData] = await Promise.all([
+        votingV2.getCurrentRoundId(),
+        votingV2.getVotePhase(),
+        votingV2.getVoterFromDelegate(wallet.account!),
+        votingV2.voterStakes(wallet.account!),
+      ])
+
+      if ((voterStakeData.stake as bigint) <= 0n) {
+        throw new Error('Only wallets with staked VotingToken can commit votes.')
+      }
+
+      if (Number(votePhase) !== 0) {
+        throw new Error('Cannot commit in reveal phase. Wait for the next commit phase.')
+      }
+
+      const commitVoter = voter as string
+      const encryptedVoteBytes = toUtf8Bytes(DEFAULT_ENCRYPTED_VOTE)
+      const commitHash = keccak256(
+        solidityPacked(
+          ['int256', 'int256', 'address', 'uint256', 'bytes', 'uint256', 'bytes32'],
+          [
+            BigInt(price),
+            BigInt(salt),
+            commitVoter,
+            selectedRequest.time,
+            selectedRequest.ancillaryData,
+            BigInt(commitRoundId),
+            selectedRequest.identifier,
+          ],
+        ),
       )
 
       const tx = await votingV2.commitAndEmitEncryptedVote(
@@ -628,23 +724,33 @@ export default function App() {
       setStoredVoteDrafts((current) => ({
         ...current,
         [selectedVotingRequestKey]: {
-          roundId: votingState.currentRoundId.toString(),
+          roundId: commitRoundId.toString(),
           price,
           salt,
-          encryptedVote,
+          encryptedVote: DEFAULT_ENCRYPTED_VOTE,
         },
       }))
-      setStatusMessage('Vote committed.')
+      setStatusMessage(commitSuccessMessage)
       await loadVotingState()
     })
   }
 
   const handleRevealVote = async () => {
-    if (!wallet.selectedProvider || !selectedVotingRequestKey) return
+    if (!wallet.selectedProvider || !selectedVotingRequestKey) {
+      setStatusMessage('Select a pending request before revealing.')
+      return
+    }
+    if (dashboard.staked <= 0n) {
+      setStatusMessage('Stake VotingToken before revealing a vote.')
+      return
+    }
     const selectedRequest = votingState.pendingRequests.find(
       (request) => getVotingRequestKey(request) === selectedVotingRequestKey,
     )
-    if (!selectedRequest) return
+    if (!selectedRequest) {
+      setStatusMessage('The selected voting request is no longer active. Refresh vote data and try again.')
+      return
+    }
 
     const draft = storedVoteDrafts[selectedVotingRequestKey]
     if (!draft) {
@@ -654,6 +760,16 @@ export default function App() {
 
     await runTransaction('Reveal vote', async () => {
       const { votingV2 } = await getUmaContracts(wallet.selectedProvider!)
+      const [votePhase, voterStakeData] = await Promise.all([
+        votingV2.getVotePhase(),
+        votingV2.voterStakes(wallet.account!),
+      ])
+      if ((voterStakeData.stake as bigint) <= 0n) {
+        throw new Error('Only wallets with staked VotingToken can reveal votes.')
+      }
+      if (Number(votePhase) !== 1) {
+        throw new Error('Reveal phase has not started yet.')
+      }
       const tx = await votingV2.revealVote(
         selectedRequest.identifier,
         selectedRequest.time,
@@ -662,9 +778,38 @@ export default function App() {
         BigInt(draft.salt),
       )
       await tx.wait()
+      setStoredVoteDrafts((current) => {
+        const next = { ...current }
+        delete next[selectedVotingRequestKey]
+        return next
+      })
       setStatusMessage('Vote revealed.')
       await loadVotingState()
     })
+  }
+
+  const handleCommitVoteClick = async () => {
+    if (!wallet.account) {
+      await handleConnectClick()
+      return
+    }
+    if (wrongChain) {
+      await handleSwitchNetwork()
+      return
+    }
+    await handleCommitVote()
+  }
+
+  const handleRevealVoteClick = async () => {
+    if (!wallet.account) {
+      await handleConnectClick()
+      return
+    }
+    if (wrongChain) {
+      await handleSwitchNetwork()
+      return
+    }
+    await handleRevealVote()
   }
 
   const handleProcessResolvableRequests = async () => {
@@ -1225,18 +1370,73 @@ export default function App() {
     votingState.pendingRequests.find((request) => getVotingRequestKey(request) === selectedVotingRequestKey) ?? null
   const selectedVoteDraft =
     (selectedVotingRequest && storedVoteDrafts[getVotingRequestKey(selectedVotingRequest)]) || null
+  const roundTimeRemaining = formatTimeRemaining(votingState.roundEnd)
+  const activeVotingPhase = VOTING_PHASES.find((phase) => phase.value === votingState.votePhase) ?? null
+  const currentVotingPhaseLabel = getVotingPhaseLabel(votingState.votePhase)
+  const hasVotingStake = dashboard.staked > 0n
+  const getVoteRequestQuery = (request: VotingRequest) =>
+    dynamicQueries.find(
+      (query) =>
+        query.unixTime === request.time.toString() &&
+        query.ancillaryData.toLowerCase() === request.ancillaryData.toLowerCase(),
+    ) ?? null
+  const getVoteRequestTitle = (request: VotingRequest) => {
+    const linkedQuery = getVoteRequestQuery(request)
+    if (linkedQuery?.title) return linkedQuery.title
+
+    const decoded = decodeAncillaryData(request.ancillaryData)
+    const matchedQuestion = decoded.match(/q:\s*([^,]+)/i)
+    if (matchedQuestion?.[1]) return matchedQuestion[1].trim()
+    return decoded.length > 88 ? `${decoded.slice(0, 88)}...` : decoded
+  }
+  const getVoteRequestSubtitle = (request: VotingRequest) => {
+    const linkedQuery = getVoteRequestQuery(request)
+    if (linkedQuery) return `Polymarket | ${linkedQuery.timestamp}`
+    return `${request.isGovernance ? 'Governance' : 'DVM'} | ${formatDateTime(request.time)}`
+  }
+  const getVoteRequestStatus = (request: VotingRequest) => {
+    const draft = storedVoteDrafts[getVotingRequestKey(request)]
+    if (!draft) {
+      return votingState.votePhase === 1 ? 'Missing commit' : 'Not committed'
+    }
+    if (votingState.votePhase === 1) return 'Ready to reveal'
+    return 'Committed'
+  }
   const commitButtonLabel =
     wallet.account === null
       ? 'Connect wallet'
-      : busyAction === 'Commit vote'
+      : !hasVotingStake
+        ? 'Stake required'
+      : busyAction === 'Commit vote' || busyAction === 'Update commit'
         ? 'Submitting...'
+      : selectedVoteDraft && votingState.votePhase === 0
+        ? 'Update commit'
+      : votingState.votePhase !== 0
+        ? 'Commit unavailable'
         : 'Commit vote'
   const revealButtonLabel =
     wallet.account === null
       ? 'Connect wallet'
+      : !hasVotingStake
+        ? 'Stake required'
+      : votingState.votePhase !== 1
+        ? 'Reveal unavailable'
       : busyAction === 'Reveal vote'
         ? 'Submitting...'
         : 'Reveal vote'
+  const votingActionMessage = (() => {
+    if (statusMessage) return statusMessage
+    if (!wallet.account) return 'Connect a wallet on Base Sepolia to start.'
+    if (wrongChain) return `Switch to ${UMA_CHAIN.chainName} before voting.`
+    if (!hasVotingStake) return 'Only wallets with staked VotingToken can commit or reveal votes.'
+    if (votingState.votePhase !== 0 && !selectedVoteDraft) {
+      return 'Commit is unavailable in the current voting window.'
+    }
+    if (selectedVoteDraft && votingState.votePhase !== 1) {
+      return 'Reveal is not open yet for this request.'
+    }
+    return ''
+  })()
   const processButtonLabel =
     wallet.account === null
       ? 'Connect wallet'
@@ -1440,9 +1640,35 @@ export default function App() {
             ) : null}
 
             {activeView === 'voting' ? (
-              <div className="console-grid">
-                <article className="panel">
-                  <h3>DVM voting queue</h3>
+              <div className="voting-layout">
+                <article className="voting-summary">
+                  <div className="voting-summary__meta">
+                    <strong>
+                      Time remaining in round: {roundTimeRemaining}
+                    </strong>
+                  </div>
+                  <div className="voting-phase-panel">
+                    <div className="voting-phase-panel__header">
+                      <span>VotingV2 phases</span>
+                      <strong>{activeVotingPhase ? `${currentVotingPhaseLabel} phase active` : 'Phase unavailable'}</strong>
+                    </div>
+                    <div className="voting-phase-track" role="list" aria-label="VotingV2 phases">
+                      {VOTING_PHASES.map((phase) => {
+                        const isActive = votingState.votePhase === phase.value
+                        return (
+                          <div
+                            key={phase.value}
+                            role="listitem"
+                            className={`voting-phase-step${isActive ? ' voting-phase-step--active' : ''}`}
+                          >
+                            <span className="voting-phase-step__eyebrow">Phase {phase.value}</span>
+                            <strong>{phase.label}</strong>
+                            <p>{phase.description}</p>
+                          </div>
+                        )
+                      })}
+                    </div>
+                  </div>
                   <div className="stats-grid">
                     <div className="stat-card">
                       <span>Current round</span>
@@ -1453,10 +1679,6 @@ export default function App() {
                       <strong>{formatDateTime(votingState.roundEnd)}</strong>
                     </div>
                     <div className="stat-card">
-                      <span>Vote phase</span>
-                      <strong>{votePhaseLabel(votingState.votePhase)}</strong>
-                    </div>
-                    <div className="stat-card">
                       <span>Pending requests</span>
                       <strong>{votingState.pendingRequests.length}</strong>
                     </div>
@@ -1464,101 +1686,68 @@ export default function App() {
                       <span>Staked UMA</span>
                       <strong>{formatTokenAmount(dashboard.staked)}</strong>
                     </div>
-                    <div className="stat-card">
-                      <span>Rewards</span>
-                      <strong>{formatTokenAmount(dashboard.rewards)}</strong>
-                    </div>
                   </div>
                   <div className="action-row">
                     <button className="ghost-button" onClick={() => void loadVotingState()} disabled={!wallet.account || wrongChain || busyAction !== null}>
-                      Refresh voting queue
+                      Refresh vote data
                     </button>
                     <button className="primary-button primary-button--small" onClick={() => void handleProcessResolvableRequests()} disabled={!wallet.account || wrongChain || busyAction !== null}>
                       {processButtonLabel}
                     </button>
                   </div>
-                  <p className="hint">
-                    When a disputed request reaches DVM, it appears in the pending queue. The flow is: wait for the next round, commit an encrypted vote, reveal the vote in the reveal phase, then process resolvable price requests.
-                  </p>
+                  {votingLoadError ? <p className="hint">Queue load error: {votingLoadError}</p> : null}
                 </article>
 
-                <article className="panel">
-                  <h3>Vote steps</h3>
-                  <label className="field">
-                    <span>Select pending request</span>
-                    <select
-                      value={selectedVotingRequestKey}
-                      onChange={(event) => setSelectedVotingRequestKey(event.target.value)}
-                    >
-                      {votingState.pendingRequests.length === 0 ? (
-                        <option value="">No pending requests</option>
-                      ) : (
-                        votingState.pendingRequests.map((request) => (
-                          <option key={getVotingRequestKey(request)} value={getVotingRequestKey(request)}>
-                            {request.identifier.slice(0, 10)}... | {request.time.toString()}
-                          </option>
-                        ))
-                      )}
-                    </select>
-                  </label>
-
-                  {selectedVotingRequest ? (
-                    <div className="drawer-metrics">
-                      <div>
-                        <span>Identifier</span>
-                        <strong>{selectedVotingRequest.identifier}</strong>
-                      </div>
-                      <div>
-                        <span>Request time</span>
-                        <strong>{formatDateTime(selectedVotingRequest.time)}</strong>
-                      </div>
-                      <div>
-                        <span>Ancillary data</span>
-                        <strong>{decodeAncillaryData(selectedVotingRequest.ancillaryData)}</strong>
-                      </div>
-                    </div>
-                  ) : null}
-
-                  <div className="field-grid">
-                    <label className="field">
-                      <span>Vote answer</span>
-                      <select value={votingAnswer} onChange={(event) => setVotingAnswer(event.target.value)}>
-                        <option>Yes</option>
-                        <option>No</option>
-                        <option>Unknown</option>
-                        <option>Custom</option>
-                      </select>
-                    </label>
-                    <label className="field">
-                      <span>Salt</span>
-                      <input value={votingSalt} onChange={(event) => setVotingSalt(event.target.value)} placeholder="987654321" />
-                    </label>
+                <article className="voting-table">
+                  <div className="voting-table__header">
+                    <span>Vote</span>
+                    <span>Your vote</span>
+                    <span>Vote status</span>
+                    <span />
                   </div>
 
-                  {votingAnswer === 'Custom' ? (
-                    <label className="field">
-                      <span>Custom vote price</span>
-                      <input value={votingCustomPrice} onChange={(event) => setVotingCustomPrice(event.target.value)} placeholder="1000000000000000000" />
-                    </label>
-                  ) : null}
-
-                  <label className="field">
-                    <span>Encrypted vote payload</span>
-                    <input value={encryptedVote} onChange={(event) => setEncryptedVote(event.target.value)} placeholder="ciphertext:mock-polymarket" />
-                  </label>
-
-                  <div className="action-row">
-                    <button className="primary-button primary-button--small" onClick={() => void handleCommitVote()} disabled={!selectedVotingRequest || !wallet.account || wrongChain || busyAction !== null}>
-                      {commitButtonLabel}
-                    </button>
-                    <button className="ghost-button" onClick={() => void handleRevealVote()} disabled={!selectedVotingRequest || !selectedVoteDraft || !wallet.account || wrongChain || busyAction !== null}>
-                      {revealButtonLabel}
-                    </button>
+                  <div className="voting-list">
+                    {votingState.pendingRequests.length === 0 ? (
+                      <div className="voting-empty">
+                        <strong>No active votes in the current queue.</strong>
+                        <p>
+                          After a disputed request reaches the DVM, it will appear here for commit and
+                          reveal.
+                        </p>
+                      </div>
+                    ) : (
+                      votingState.pendingRequests.map((request) => {
+                        const requestKey = getVotingRequestKey(request)
+                        const draft = storedVoteDrafts[requestKey]
+                        return (
+                          <button
+                            key={requestKey}
+                            className="vote-row"
+                            onClick={() => {
+                              setSelectedVotingRequestKey(requestKey)
+                              setVotingDrawerOpen(true)
+                            }}
+                          >
+                            <div className="vote-row__question">
+                              <span className="vote-row__icon">⬡</span>
+                              <div>
+                                <strong>{getVoteRequestTitle(request)}</strong>
+                                <small>{getVoteRequestSubtitle(request)}</small>
+                              </div>
+                            </div>
+                            <span className="vote-row__vote">
+                              {draft ? formatOracleAnswer(BigInt(draft.price)) : '-'}
+                            </span>
+                            <span className="vote-row__status">
+                              <span className="vote-row__dot" />
+                              {getVoteRequestStatus(request)}
+                            </span>
+                            <span className="query-row__arrow">›</span>
+                          </button>
+                        )
+                      })
+                    )}
                   </div>
-
-                  <p className="hint">
-                    Stored commit draft: {selectedVoteDraft ? `price ${selectedVoteDraft.price}, salt ${selectedVoteDraft.salt}, round ${selectedVoteDraft.roundId}` : 'none yet'}
-                  </p>
                 </article>
               </div>
             ) : null}
@@ -1591,6 +1780,108 @@ export default function App() {
         error={wallet.error}
         onRefresh={refreshProviders}
       />
+
+      {votingDrawerOpen && selectedVotingRequest ? (
+        <div className="drawer-backdrop" onClick={() => setVotingDrawerOpen(false)}>
+          <aside className="query-drawer" onClick={(event) => event.stopPropagation()}>
+            <div className="query-drawer__header">
+              <strong>{getVoteRequestTitle(selectedVotingRequest)}</strong>
+              <button className="icon-button" onClick={() => setVotingDrawerOpen(false)} aria-label="Close">
+                ×
+              </button>
+            </div>
+
+            <div className="query-tags">
+              <span>{selectedVotingRequest.isGovernance ? 'Governance' : 'Polymarket / OO dispute'}</span>
+              <span>Round {votingState.currentRoundId.toString()}</span>
+              <span className={activeVotingPhase ? 'query-tags__phase query-tags__phase--active' : 'query-tags__phase'}>
+                Phase: {currentVotingPhaseLabel}
+              </span>
+            </div>
+
+            <div className="query-drawer__section">
+              <div className="query-drawer__section-title">
+                <span className="query-drawer__icon">◉</span>
+                <h3>Vote action</h3>
+              </div>
+
+              <div className="drawer-metrics">
+                <div>
+                  <span>Status</span>
+                  <strong>{getVoteRequestStatus(selectedVotingRequest)}</strong>
+                </div>
+                <div>
+                  <span>Request time</span>
+                  <strong>{formatDateTime(selectedVotingRequest.time)}</strong>
+                </div>
+                <div>
+                  <span>Last voting round</span>
+                  <strong>{selectedVotingRequest.lastVotingRound.toString()}</strong>
+                </div>
+                <div>
+                  <span>Roll count</span>
+                  <strong>{selectedVotingRequest.rollCount.toString()}</strong>
+                </div>
+              </div>
+
+              <div className="field-grid">
+                <label className="field">
+                  <span>Vote answer</span>
+                  <select value={votingAnswer} onChange={(event) => setVotingAnswer(event.target.value)}>
+                    <option>Yes</option>
+                    <option>No</option>
+                    <option>Unknown</option>
+                    <option>Custom</option>
+                  </select>
+                </label>
+              </div>
+
+              {votingAnswer === 'Custom' ? (
+                <label className="field">
+                  <span>Custom vote price</span>
+                  <input value={votingCustomPrice} onChange={(event) => setVotingCustomPrice(event.target.value)} placeholder="1000000000000000000" />
+                </label>
+              ) : null}
+
+              {votingActionMessage ? <p className="drawer-status">{votingActionMessage}</p> : null}
+
+              <div className="query-drawer__actions">
+                <button
+                  className="primary-button"
+                  onClick={() => void handleCommitVoteClick()}
+                  disabled={!hasVotingStake || busyAction !== null || votingState.votePhase !== 0}
+                >
+                  {commitButtonLabel}
+                </button>
+                <button
+                  className="ghost-button"
+                  onClick={() => void handleRevealVoteClick()}
+                  disabled={!hasVotingStake || !selectedVoteDraft || busyAction !== null || votingState.votePhase !== 1}
+                >
+                  {revealButtonLabel}
+                </button>
+              </div>
+            </div>
+
+            <div className="query-drawer__section">
+              <div className="query-drawer__section-title">
+                <span className="query-drawer__icon">ⓘ</span>
+                <h3>Request details</h3>
+              </div>
+              <div className="drawer-links">
+                <div>
+                  <span>Identifier</span>
+                  <strong>{selectedVotingRequest.identifier}</strong>
+                </div>
+                <div>
+                  <span>Ancillary text</span>
+                  <strong>{decodeAncillaryData(selectedVotingRequest.ancillaryData)}</strong>
+                </div>
+              </div>
+            </div>
+          </aside>
+        </div>
+      ) : null}
 
       {selectedQuery ? (
         <div className="drawer-backdrop" onClick={() => setSelectedQuery(null)}>

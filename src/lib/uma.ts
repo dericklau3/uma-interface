@@ -10,6 +10,7 @@ import {
 } from 'ethers'
 import { MulticallProvider } from '@ethers-ext/provider-multicall'
 import type { EIP6963ProviderDetail } from '../wallet/types'
+import { votingV2Abi } from './votingV2Abi'
 
 export const UMA_CHAIN = {
   chainId: 84532,
@@ -46,26 +47,6 @@ export const erc20Abi = [
   'function balanceOf(address owner) view returns (uint256)',
   'function allowance(address owner, address spender) view returns (uint256)',
   'function approve(address spender, uint256 amount) returns (bool)',
-] as const
-
-export const votingV2Abi = [
-  'function votingToken() view returns (address)',
-  'function stake(uint128 amount)',
-  'function requestUnstake(uint128 amount)',
-  'function executeUnstake()',
-  'function withdrawRewards() returns (uint128)',
-  'function withdrawAndRestake() returns (uint128)',
-  'function outstandingRewards(address voter) view returns (uint256)',
-  'function getVoterStakePostUpdate(address voter) returns (uint128)',
-  'function voterStakes(address voter) view returns (uint128 stake, uint128 pendingUnstake, uint128 rewardsPaidPerToken, uint128 outstandingRewards, int128 unappliedSlash, uint64 nextIndexToProcess, uint64 unstakeTime, address delegate)',
-  'function unstakeCoolDown() view returns (uint64)',
-  'function getCurrentRoundId() view returns (uint32)',
-  'function getRoundEndTime(uint32 roundId) view returns (uint256)',
-  'function getPendingRequests() view returns ((bytes32 identifier, uint256 time, bytes ancillaryData)[])',
-  'function getVotePhase() view returns (uint8)',
-  'function commitAndEmitEncryptedVote(bytes32 identifier, uint256 time, bytes ancillaryData, bytes32 hash, bytes encryptedVote)',
-  'function revealVote(bytes32 identifier, uint256 time, int256 price, bytes ancillaryData, int256 salt)',
-  'function processResolvablePriceRequests()',
 ] as const
 
 export const optimisticOracleV2Abi = [
@@ -176,6 +157,15 @@ export async function getUmaReadContracts(providerDetail: EIP6963ProviderDetail)
     optimisticOracleV2: new Contract(UMA_CONTRACTS.optimisticOracleV2, optimisticOracleV2Abi, multicallProvider),
     governorV2: new Contract(UMA_CONTRACTS.governorV2, governorV2Abi, multicallProvider),
   }
+}
+
+export type PendingVotingRequest = {
+  lastVotingRound: bigint
+  isGovernance: boolean
+  identifier: string
+  time: bigint
+  rollCount: bigint
+  ancillaryData: string
 }
 
 export type ParsedUmaRequest = {
