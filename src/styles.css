@@ -437,6 +437,14 @@ textarea {
   background: #fcfbfc;
 }
 
+.field input:disabled,
+.field textarea:disabled,
+.field select:disabled {
+  color: #5f5961;
+  background: #f2eff1;
+  cursor: not-allowed;
+}
+
 .field textarea {
   min-height: 96px;
 }

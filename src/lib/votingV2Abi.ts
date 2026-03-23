@@ -70,6 +70,13 @@ export const votingV2Abi = [
   },
   {
     type: 'function',
+    name: 'gat',
+    inputs: [],
+    outputs: [{ name: '', type: 'uint128', internalType: 'uint128' }],
+    stateMutability: 'view',
+  },
+  {
+    type: 'function',
     name: 'getVoterStakePostUpdate',
     inputs: [{ name: 'voter', type: 'address', internalType: 'address' }],
     outputs: [{ name: '', type: 'uint128', internalType: 'uint128' }],

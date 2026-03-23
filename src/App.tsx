@@ -50,6 +50,7 @@ type VotingState = {
   currentRoundId: bigint
   roundEnd: bigint
   votePhase: number | null
+  gat: bigint
   pendingRequests: VotingRequest[]
 }
 
@@ -58,6 +59,10 @@ type StoredVoteDraft = {
   price: string
   salt: string
   encryptedVote: string
+}
+
+type StoredRevealedVote = {
+  price: string
 }
 
 type OracleLookupState = {
@@ -140,6 +145,7 @@ const emptyVotingState: VotingState = {
   currentRoundId: 0n,
   roundEnd: 0n,
   votePhase: null,
+  gat: 0n,
   pendingRequests: [],
 }
 
@@ -154,6 +160,7 @@ function getErrorMessage(error: unknown, fallback: string) {
 
 const DYNAMIC_QUERIES_STORAGE_KEY = 'uma.dynamicQueries.v2'
 const VOTING_DRAFTS_STORAGE_KEY = 'uma.votingDrafts.v1'
+const REVEALED_VOTES_STORAGE_KEY = 'uma.revealedVotes.v1'
 const ORACLE_SYNC_RETRY_DELAY_MS = 900
 const ORACLE_SYNC_MAX_ATTEMPTS = 6
 const DEFAULT_VOTING_SALT = '987654321'
@@ -206,6 +213,13 @@ function formatTimeRemaining(target: bigint) {
 
 function getVotingPhaseLabel(phase: number | null) {
   return VOTING_PHASES.find((item) => item.value === phase)?.label ?? 'Unavailable'
+}
+
+function getVoteSelectionFromDraft(draft: StoredVoteDraft) {
+  if (draft.price === '1000000000000000000') return { answer: 'Yes', customPrice: '' }
+  if (draft.price === '0') return { answer: 'No', customPrice: '' }
+  if (draft.price === '500000000000000000') return { answer: 'Unknown', customPrice: '' }
+  return { answer: 'Custom', customPrice: draft.price }
 }
 
 function WalletModal({
@@ -315,6 +329,16 @@ export default function App() {
       return {}
     }
   })
+  const [storedRevealedVotes, setStoredRevealedVotes] = useState<Record<string, StoredRevealedVote>>(() => {
+    try {
+      const raw = window.localStorage.getItem(REVEALED_VOTES_STORAGE_KEY)
+      if (!raw) return {}
+      const parsed = JSON.parse(raw) as Record<string, StoredRevealedVote>
+      return parsed && typeof parsed === 'object' ? parsed : {}
+    } catch {
+      return {}
+    }
+  })
   const [selectedQuery, setSelectedQuery] = useState<ProposeQuery | null>(null)
   const [selectedAnswer, setSelectedAnswer] = useState('Yes')
   const [customAnswer, setCustomAnswer] = useState('')
@@ -336,6 +360,10 @@ export default function App() {
   useEffect(() => {
     window.localStorage.setItem(VOTING_DRAFTS_STORAGE_KEY, JSON.stringify(storedVoteDrafts))
   }, [storedVoteDrafts])
+
+  useEffect(() => {
+    window.localStorage.setItem(REVEALED_VOTES_STORAGE_KEY, JSON.stringify(storedRevealedVotes))
+  }, [storedRevealedVotes])
 
   useEffect(() => {
     if (!wallet.account || !wallet.selectedProvider || wrongChain) {
@@ -364,6 +392,38 @@ export default function App() {
 
     void loadOracleRequest(nextForm, selectedQuery)
   }, [selectedQuery, wallet.selectedProvider, wallet.chainId, wrongChain])
+
+  useEffect(() => {
+    if (!selectedVotingRequestKey) {
+      setVotingAnswer('Yes')
+      setVotingCustomPrice('')
+      return
+    }
+
+    const draft = storedVoteDrafts[selectedVotingRequestKey]
+    if (draft) {
+      const nextSelection = getVoteSelectionFromDraft(draft)
+      setVotingAnswer(nextSelection.answer)
+      setVotingCustomPrice(nextSelection.customPrice)
+      return
+    }
+
+    const revealedVote = storedRevealedVotes[selectedVotingRequestKey]
+    if (!revealedVote) {
+      setVotingAnswer('Yes')
+      setVotingCustomPrice('')
+      return
+    }
+
+    const nextSelection = getVoteSelectionFromDraft({
+      roundId: '',
+      salt: '',
+      encryptedVote: '',
+      price: revealedVote.price,
+    })
+    setVotingAnswer(nextSelection.answer)
+    setVotingCustomPrice(nextSelection.customPrice)
+  }, [selectedVotingRequestKey, storedVoteDrafts, storedRevealedVotes])
 
   const refreshOnchainState = async () => {
     if (!wallet.account || !wallet.selectedProvider) return
@@ -428,10 +488,11 @@ export default function App() {
     if (!wallet.selectedProvider) return
 
     const { votingV2 } = await getUmaReadContracts(wallet.selectedProvider)
-    const [roundResult, pendingResult, phaseResult] = await Promise.allSettled([
+    const [roundResult, pendingResult, phaseResult, gatResult] = await Promise.allSettled([
       votingV2.getCurrentRoundId(),
       votingV2.getPendingRequests(),
       votingV2.getVotePhase(),
+      votingV2.gat(),
     ])
 
     const nextState: VotingState = {
@@ -440,6 +501,7 @@ export default function App() {
       roundEnd: emptyVotingState.roundEnd,
       votePhase:
         phaseResult.status === 'fulfilled' ? Number(phaseResult.value) : emptyVotingState.votePhase,
+      gat: emptyVotingState.gat,
       pendingRequests: [],
     }
 
@@ -481,6 +543,12 @@ export default function App() {
 
     if (phaseResult.status === 'rejected') {
       errors.push(`vote phase: ${getErrorMessage(phaseResult.reason, 'failed to read vote phase')}`)
+    }
+
+    if (gatResult.status === 'fulfilled') {
+      nextState.gat = gatResult.value as bigint
+    } else {
+      errors.push(`gat: ${getErrorMessage(gatResult.reason, 'failed to read gat')}`)
     }
 
     setVotingState(nextState)
@@ -730,6 +798,11 @@ export default function App() {
           encryptedVote: DEFAULT_ENCRYPTED_VOTE,
         },
       }))
+      setStoredRevealedVotes((current) => {
+        const next = { ...current }
+        delete next[selectedVotingRequestKey]
+        return next
+      })
       setStatusMessage(commitSuccessMessage)
       await loadVotingState()
     })
@@ -783,6 +856,12 @@ export default function App() {
         delete next[selectedVotingRequestKey]
         return next
       })
+      setStoredRevealedVotes((current) => ({
+        ...current,
+        [selectedVotingRequestKey]: {
+          price: draft.price,
+        },
+      }))
       setStatusMessage('Vote revealed.')
       await loadVotingState()
     })
@@ -1370,10 +1449,14 @@ export default function App() {
     votingState.pendingRequests.find((request) => getVotingRequestKey(request) === selectedVotingRequestKey) ?? null
   const selectedVoteDraft =
     (selectedVotingRequest && storedVoteDrafts[getVotingRequestKey(selectedVotingRequest)]) || null
+  const selectedRevealedVote =
+    (selectedVotingRequest && storedRevealedVotes[getVotingRequestKey(selectedVotingRequest)]) || null
   const roundTimeRemaining = formatTimeRemaining(votingState.roundEnd)
   const activeVotingPhase = VOTING_PHASES.find((phase) => phase.value === votingState.votePhase) ?? null
   const currentVotingPhaseLabel = getVotingPhaseLabel(votingState.votePhase)
   const hasVotingStake = dashboard.staked > 0n
+  const isRevealPhase = votingState.votePhase === 1
+  const isVoteAnswerLocked = isRevealPhase
   const getVoteRequestQuery = (request: VotingRequest) =>
     dynamicQueries.find(
       (query) =>
@@ -1396,6 +1479,8 @@ export default function App() {
   }
   const getVoteRequestStatus = (request: VotingRequest) => {
     const draft = storedVoteDrafts[getVotingRequestKey(request)]
+    const revealedVote = storedRevealedVotes[getVotingRequestKey(request)]
+    if (revealedVote) return 'Revealed'
     if (!draft) {
       return votingState.votePhase === 1 ? 'Missing commit' : 'Not committed'
     }
@@ -1429,6 +1514,7 @@ export default function App() {
     if (!wallet.account) return 'Connect a wallet on Base Sepolia to start.'
     if (wrongChain) return `Switch to ${UMA_CHAIN.chainName} before voting.`
     if (!hasVotingStake) return 'Only wallets with staked VotingToken can commit or reveal votes.'
+    if (selectedRevealedVote) return 'Vote revealed.'
     if (votingState.votePhase !== 0 && !selectedVoteDraft) {
       return 'Commit is unavailable in the current voting window.'
     }
@@ -1719,6 +1805,7 @@ export default function App() {
                       votingState.pendingRequests.map((request) => {
                         const requestKey = getVotingRequestKey(request)
                         const draft = storedVoteDrafts[requestKey]
+                        const revealedVote = storedRevealedVotes[requestKey]
                         return (
                           <button
                             key={requestKey}
@@ -1736,7 +1823,11 @@ export default function App() {
                               </div>
                             </div>
                             <span className="vote-row__vote">
-                              {draft ? formatOracleAnswer(BigInt(draft.price)) : '-'}
+                              {draft
+                                ? formatOracleAnswer(BigInt(draft.price))
+                                : revealedVote
+                                  ? formatOracleAnswer(BigInt(revealedVote.price))
+                                  : '-'}
                             </span>
                             <span className="vote-row__status">
                               <span className="vote-row__dot" />
@@ -1826,8 +1917,15 @@ export default function App() {
 
               <div className="field-grid">
                 <label className="field">
-                  <span>Vote answer</span>
-                  <select value={votingAnswer} onChange={(event) => setVotingAnswer(event.target.value)}>
+                  <span className="field__header">
+                    <span>Vote answer</span>
+                    {isVoteAnswerLocked ? <strong>Locked in reveal phase</strong> : null}
+                  </span>
+                  <select
+                    value={votingAnswer}
+                    onChange={(event) => setVotingAnswer(event.target.value)}
+                    disabled={isVoteAnswerLocked}
+                  >
                     <option>Yes</option>
                     <option>No</option>
                     <option>Unknown</option>
@@ -1839,7 +1937,12 @@ export default function App() {
               {votingAnswer === 'Custom' ? (
                 <label className="field">
                   <span>Custom vote price</span>
-                  <input value={votingCustomPrice} onChange={(event) => setVotingCustomPrice(event.target.value)} placeholder="1000000000000000000" />
+                  <input
+                    value={votingCustomPrice}
+                    onChange={(event) => setVotingCustomPrice(event.target.value)}
+                    placeholder="1000000000000000000"
+                    disabled={isVoteAnswerLocked}
+                  />
                 </label>
               ) : null}
 
